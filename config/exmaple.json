@@ -1,0 +1,11 @@
+
+{
+    "model":{
+        "batch_size" : 1,
+        "focal": 1015, 
+        "model_type": "bfm09",
+        "render" :true,
+        "model_path": "BFM/BFM09_model_info.mat",
+        "img_size" :[256, 256]
+    }
+}
