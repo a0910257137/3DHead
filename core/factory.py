@@ -3,14 +3,11 @@ from .bfm09l import BFM09
 
 
 class ModelFactory:
-
     def __init__(self, config):
         self.config = config
 
     def build_model(self):
-
         recon_model = self.get_model()
-
         return recon_model
 
     def get_model(self):

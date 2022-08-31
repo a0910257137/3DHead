@@ -9,34 +9,112 @@ from pytorch3d.renderer import (look_at_view_transform, FoVPerspectiveCameras,
                                 PointLights, RasterizationSettings,
                                 MeshRenderer, MeshRasterizer, SoftPhongShader,
                                 TexturesVertex, blending)
-class BFM09(Base):
 
+
+class BFM09(tf.keras.Model):
     def __init__(self, config, model_dict, **kargs):
-
-        Base.__init__(self, config, **kargs)
+        super(BFM09, self).__init__()
+        base = Base(config)
+        self.model_dict = model_dict
         self.config = config
-        self.skinmask = tf.cast(model_dict['skinmask'], tf.float32)
+        self.batch_size = self.config.batch_size
+        self.focal = self.config.focal
+        self.img_size = self.config.img_size[0]
+        self.device = torch.device('cuda:0')
+        self.renderer = base._get_renderer(self.img_size, self.focal,
+                                           self.device)
 
-        self.kp_inds = tf.cast(model_dict['keypoints'].squeeze(), tf.int32)
+        self.reverse_z = base._get_reverse_z()
+        self.camera_pos = base._get_camera_pose()
+        self.p_mat = base._get_p_mat(self.img_size, self.focal)
 
-        self.meanshape = tf.cast(model_dict['meanshape'], tf.float32)
+        self.id_dims = 80
+        self.tex_dims = 80
+        self.exp_dims = 64
 
-        self.idBase = tf.cast(model_dict['idBase'], tf.float32)
+    def build(self, input_shape):
+        self.skinmask = tf.Variable(tf.cast(self.model_dict['skinmask'],
+                                            tf.float32),
+                                    dtype=tf.dtypes.float32,
+                                    name='skinmask',
+                                    trainable=False)
+        self.kp_inds = tf.Variable(tf.cast(
+            self.model_dict['keypoints'].squeeze(), tf.int32),
+                                   dtype=tf.dtypes.int32,
+                                   name='kp_inds',
+                                   trainable=False)
+        self.meanshape = tf.Variable(tf.cast(self.model_dict['meanshape'],
+                                             tf.float32),
+                                     dtype=tf.dtypes.float32,
+                                     name='meanshape',
+                                     trainable=False)
 
-        self.expBase = tf.cast(model_dict['exBase'], tf.float32)
-        self.meantex = tf.cast(model_dict['meantex'], tf.float32)
-        self.texBase = tf.cast(model_dict['texBase'], tf.float32)
+        self.idBase = tf.Variable(tf.cast(self.model_dict['idBase'],
+                                          tf.float32),
+                                  dtype=tf.dtypes.float32,
+                                  name='idBase',
+                                  trainable=False)
+        self.expBase = tf.Variable(tf.cast(self.model_dict['exBase'],
+                                           tf.float32),
+                                   dtype=tf.dtypes.float32,
+                                   name='exBase',
+                                   trainable=False)
+        self.meantex = tf.Variable(tf.cast(self.model_dict['meantex'],
+                                           tf.float32),
+                                   dtype=tf.dtypes.float32,
+                                   name='meantex',
+                                   trainable=False)
 
-        self.tri = tf.cast(model_dict['tri'] - 1, tf.int64)
-        self.point_buf = tf.cast(model_dict['point_buf'] - 1, tf.int64)
-        self.keys = ["lms_proj"]
-        if self.config.render:
-            self.keys += ["rendered_img", "face_texture", "vs", "tri", "color"]
+        self.texBase = tf.Variable(tf.cast(self.model_dict['texBase'],
+                                           tf.float32),
+                                   dtype=tf.dtypes.float32,
+                                   name='texBase',
+                                   trainable=False)
 
-        
+        self.tri = tf.Variable(tf.cast(self.model_dict['tri'] - 1, tf.int64),
+                               dtype=tf.dtypes.int64,
+                               name='tri',
+                               trainable=False)
 
-    def __call__(self, coeffs, render=True):
+        self.point_buf = tf.Variable(tf.cast(self.model_dict['point_buf'] - 1,
+                                             tf.int64),
+                                     dtype=tf.dtypes.int64,
+                                     name='tri',
+                                     trainable=False)
 
+        self.id_tensor = tf.Variable(initial_value=tf.zeros(
+            shape=(1, self.id_dims),
+            dtype=tf.dtypes.float32,
+        ),
+                                     name='id',
+                                     trainable=True)
+
+        self.tex_tensor = tf.Variable(tf.zeros(shape=(1, self.tex_dims)),
+                                      dtype=tf.dtypes.float32,
+                                      name='tex',
+                                      trainable=True)
+        self.exp_tensor = tf.Variable(tf.zeros(shape=(self.batch_size,
+                                                      self.exp_dims)),
+                                      dtype=tf.dtypes.float32,
+                                      name='exp',
+                                      trainable=True)
+
+        self.gamma_tensor = tf.Variable(tf.zeros(shape=(self.batch_size, 27)),
+                                        dtype=tf.dtypes.float32,
+                                        name='gamma',
+                                        trainable=True)
+        self.trans_tensor = tf.Variable(tf.zeros(shape=(self.batch_size, 3)),
+                                        dtype=tf.dtypes.float32,
+                                        name='trans',
+                                        trainable=True)
+        self.rot_tensor = tf.Variable(tf.zeros(shape=(self.batch_size, 3)),
+                                      dtype=tf.dtypes.float32,
+                                      name='rot',
+                                      trainable=True)
+        super(BFM09, self).build(input_shape)
+
+    def call(self, render=True, training=False):
+        coeffs = self._packed_tensors()
         batch = tf.shape(coeffs)[0]
         id_coeff, exp_coeff, tex_coeff, angles, gamma, translation = self._split_coeffs(
             coeffs)
@@ -48,7 +126,7 @@ class BFM09(Base):
         lms_proj = self.project_vs(batch, lms_t)
 
         lms_proj = tf.stack(
-            [lms_proj[:, :, 0], self.img_size - lms_proj[:, :, 1]], axis =2)
+            [lms_proj[:, :, 0], self.img_size - lms_proj[:, :, 1]], axis=2)
         if render:
             face_texture = self.get_color(batch, tex_coeff)
             face_norm = self.compute_norm(batch, vs, self.tri, self.point_buf)
@@ -56,15 +134,14 @@ class BFM09(Base):
             face_color = self.add_illumination(face_texture, face_norm_r,
                                                gamma)
 
-            tf.numpy_function(self._render_mesh, 
-                                inp=[vs_t, face_color, 
-                                tf.tile(self.tri[None, ...], [batch, 1, 1])], 
-                            Tout=[tf.float32])
-            face_color_tv = TexturesVertex(face_color)
-            mesh = Meshes(vs_t, self.tri.repeat(batch, 1, 1),
-                          face_color_tv)
-            rendered_img = self.renderer(mesh)
-            rendered_img = tf.clip_by_value(rendered_img, 0., 255.)
+            rendered_img = tf.numpy_function(self._render_mesh,
+                                             inp=[
+                                                 vs_t, face_color,
+                                                 tf.tile(
+                                                     self.tri[None, ...],
+                                                     [batch, 1, 1])
+                                             ],
+                                             Tout=[tf.float32])
             return {
                 'rendered_img': rendered_img,
                 'lms_proj': lms_proj,
@@ -72,10 +149,49 @@ class BFM09(Base):
                 'vs': vs_t,
                 'tri': self.tri,
                 'color': face_color
-                }
+            }
         else:
             return {'lms_proj': lms_proj}
-        
+
+    def _packed_tensors(self):
+        return tf.concat([
+            tf.tile(self.id_tensor, [self.batch_size, 1]), self.exp_tensor,
+            tf.tile(self.tex_tensor, [self.batch_size, 1]), self.rot_tensor,
+            self.gamma_tensor, self.trans_tensor
+        ],
+                         axis=-1)
+
+    def _split_coeffs(self, coeffs):
+        id_coeff = coeffs[:, :80]  # identity(shape) coeff of dim 80
+        exp_coeff = coeffs[:, 80:144]  # expression coeff of dim 64
+        tex_coeff = coeffs[:, 144:224]  # texture(albedo) coeff of dim 80
+        # ruler angles(x,y,z) for rotation of dim 3
+        angles = coeffs[:, 224:227]
+        # lighting coeff for 3 channel SH function of dim 27
+        gamma = coeffs[:, 227:254]
+        translation = coeffs[:, 254:]  # translation coeff of dim 3
+        return id_coeff, exp_coeff, tex_coeff, angles, gamma, translation
+
+    def get_rot_tensor(self):
+        return self.rot_tensor
+
+    def get_trans_tensor(self):
+        return self.trans_tensor
+
+    def get_exp_tensor(self):
+        return self.exp_tensor
+
+    def get_tex_tensor(self):
+        return self.tex_tensor
+
+    def get_id_tensor(self):
+        return self.id_tensor
+
+    def get_gamma_tensor(self):
+        return self.gamma_tensor
+
+    def get_skinmask(self):
+        return self.skinmask
 
     def get_vs(self, batch, id_coeff, exp_coeff):
         face_shape = tf.einsum('ij,aj->ai', self.idBase, id_coeff) + \
@@ -113,19 +229,21 @@ class BFM09(Base):
         b_idx = tf.range(batch)[:, None]
         n = self.kp_inds.get_shape().as_list()
         b_idx = tf.tile(b_idx, [n[0], 1])
-        inds = tf.concat([ b_idx, self.kp_inds[:, None]], axis = -1)
+        inds = tf.concat([b_idx, self.kp_inds[:, None]], axis=-1)
         lms = tf.reshape(tf.gather_nd(vs, inds), [batch, n[0], 3])
         return lms
-        
-    def get_color(self, batch , tex_coeff):
-        face_texture = tf.einsum('ij,aj->ai', self.texBase,  
-                                    tex_coeff) + self.meantex
+
+    def get_color(self, batch, tex_coeff):
+        face_texture = tf.einsum('ij,aj->ai', self.texBase,
+                                 tex_coeff) + self.meantex
         face_texture = tf.reshape(face_texture, [batch, -1, 3])
         return face_texture
 
     def project_vs(self, batch, vs):
-        vs  =  tf.matmul(vs, tf.tile(self.reverse_z, [batch, 1, 1]))  + self.camera_pos
-        aug_projection = tf.matmul(vs, tf.transpose(tf.tile(self.p_mat, [batch, 1, 1]), [0, 2, 1]))
+        vs = tf.matmul(vs, tf.tile(self.reverse_z,
+                                   [batch, 1, 1])) + self.camera_pos
+        aug_projection = tf.matmul(
+            vs, tf.transpose(tf.tile(self.p_mat, [batch, 1, 1]), [0, 2, 1]))
         face_projection = aug_projection[:, :, :2] / \
             tf.reshape(aug_projection[:, :, 2], [batch, -1, 1])
         return face_projection
@@ -135,31 +253,39 @@ class BFM09(Base):
         n, _ = face_id.get_shape().as_list()
         point_id = point_buf
         b_idx = tf.tile(tf.range(batch, dtype=tf.int32)[:, None], [n, 1])
-        v1 = tf.reshape(tf.gather_nd(vs, tf.concat([b_idx, face_id[:, :1]], axis =- 1)), (-1, n, 3))
-        v2 = tf.reshape(tf.gather_nd(vs,  tf.concat([b_idx, face_id[:, 1:2]], axis =- 1)),  (-1, n, 3))
-        
-        v3 = tf.reshape(tf.gather_nd(vs,   tf.concat([b_idx, face_id[:, 2:]], axis =- 1)), (-1, n, 3))
+        v1 = tf.reshape(
+            tf.gather_nd(vs, tf.concat([b_idx, face_id[:, :1]], axis=-1)),
+            (-1, n, 3))
+        v2 = tf.reshape(
+            tf.gather_nd(vs, tf.concat([b_idx, face_id[:, 1:2]], axis=-1)),
+            (-1, n, 3))
+
+        v3 = tf.reshape(
+            tf.gather_nd(vs, tf.concat([b_idx, face_id[:, 2:]], axis=-1)),
+            (-1, n, 3))
         e1 = v1 - v2
         e2 = v2 - v3
         face_norm = tf.linalg.cross(e1, e2)
 
-        empty = tf.zeros((tf.shape(face_norm)[0], 1, 3),
-                            dtype=face_norm.dtype)
+        empty = tf.zeros((tf.shape(face_norm)[0], 1, 3), dtype=face_norm.dtype)
 
         face_norm = tf.concat((face_norm, empty), 1)
-        v_norm = tf.numpy_function(self.get_nnorm, inp=[ face_norm, point_id], Tout=[tf.float32])
+        v_norm = tf.numpy_function(self.get_nnorm,
+                                   inp=[face_norm, point_id],
+                                   Tout=[tf.float32])
         return v_norm
 
     def get_nnorm(self, face_norm, point_id):
-        v_norm = np.sum(face_norm [:, point_id, :], axis = 2)
-        v_norm = v_norm / np.expand_dims(np.linalg.norm(v_norm, axis = 2), axis = -1)
-        return  v_norm
+        v_norm = np.sum(face_norm[:, point_id, :], axis=2)
+        v_norm = v_norm / np.expand_dims(np.linalg.norm(v_norm, axis=2),
+                                         axis=-1)
+        return v_norm
 
     def add_illumination(self, face_texture, norm, gamma):
         n_b, num_vertex, _ = face_texture.get_shape().as_list()
         n_v_full = n_b * num_vertex
         gamma = tf.identity(tf.reshape(gamma, (-1, 3, 9)))
-        gamma = tf.concat([gamma[..., :1] + 0.8, gamma[..., 1:]], axis = -1)
+        gamma = tf.concat([gamma[..., :1] + 0.8, gamma[..., 1:]], axis=-1)
         gamma = tf.transpose(gamma, [0, 2, 1])
 
         a0 = np.pi
@@ -183,7 +309,7 @@ class BFM09(Base):
         arrH.append(-a1 * c1 * nx)
         arrH.append(a2 * c2 * nx * ny)
         arrH.append(-a2 * c2 * ny * nz)
-        arrH.append(a2 * c2 * d0 * (3 *  tf.math.pow(nz, 2) - 1))
+        arrH.append(a2 * c2 * d0 * (3 * tf.math.pow(nz, 2) - 1))
         arrH.append(-a2 * c2 * nx * nz)
         arrH.append(a2 * c2 * 0.5 * (tf.math.pow(nx, 2) - tf.math.pow(ny, 2)))
 
@@ -195,27 +321,23 @@ class BFM09(Base):
         return face_color
 
     def _render_mesh(self, vs_t, face_color, tri):
-        vs_t = torch.tensor(vs_t, 
+        device = torch.device('cuda:0')
+
+        vs_t = torch.tensor(vs_t,
                             dtype=torch.float32,
                             requires_grad=False,
-                            device='cpu')
+                            device=device)
 
-        face_color = torch.tensor(face_color, 
-                                dtype=torch.float32,
-                                requires_grad=False,
-                                device='cpu')
-        tri = torch.tensor(tri, 
-                        dtype=torch.float32,
-                        requires_grad=False, 
-                        device='cpu')
-    
-        
+        face_color = torch.tensor(face_color,
+                                  dtype=torch.float32,
+                                  requires_grad=False,
+                                  device=device)
+        tri = torch.tensor(tri,
+                           dtype=torch.float32,
+                           requires_grad=False,
+                           device=device)
         face_color_tv = TexturesVertex(face_color)
         mesh = Meshes(vs_t, tri, face_color_tv)
-        
         rendered_img = self.renderer(mesh)
-        
-        # rendered_img = torch.clamp(rendered_img, 0, 255)
-        
-        
-        return 
+        rendered_img = torch.clamp(rendered_img, 0, 255)
+        return rendered_img.cpu().detach().numpy()
